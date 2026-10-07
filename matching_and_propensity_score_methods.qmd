@@ -1,0 +1,531 @@
+---
+title: "Problem Set 3: Unconfoundedness-Based Designs"
+subtitle: "Matching and Propensity Score Methods: A New Hope"
+author: "Ethan Walker"
+date: "May 28, 2026"
+format:
+  pdf:
+    toc: true
+    number-sections: false
+    geometry:
+      - margin=1in
+    fontsize: 11pt
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    fig.align: center
+    fig.width: 6
+    fig.height: 4
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(Matching)
+library(ggplot2)
+
+nsw_dw_psid_df <- read_xls("nsw_dw_psid_small_econ440.xls")
+```
+
+## Question 1
+
+```{r}
+#| label: q1
+#| include: false
+nsw_dw_psid_df <- nsw_dw_psid_df |>
+  mutate(
+    u74 = as.integer(re74 == 0),
+    u75 = as.integer(re75 == 0)
+  )
+```
+
+Two new variables were created. The variable `u74` ("unemployed in 1974") equals one if `re74 == 0` and zero otherwise. The variable `u75` ("unemployed in 1975") is defined analogously for `re75`. Both serve as flags for individuals with no reported labor earnings in the corresponding pre-treatment year.
+
+## Question 2
+
+```{r}
+#| label: q2-balance
+covars <- c("age", "education", "black", "hispanic", "married",
+            "nodegree", "re74", "re75", "u74", "u75")
+
+labels <- c(
+  age       = "Age",
+  education = "Years of education",
+  black     = "Black",
+  hispanic  = "Hispanic",
+  married   = "Married",
+  nodegree  = "No high school degree",
+  re74      = "Earnings 1974",
+  re75      = "Earnings 1975",
+  u74       = "Unemployed 1974",
+  u75       = "Unemployed 1975"
+)
+
+balance_q2 <- map_dfr(covars, function(v) {
+  tt <- t.test(nsw_dw_psid_df[[v]] ~ nsw_dw_psid_df$treat)
+  tibble(
+    Variable     = labels[[v]],
+    Treated      = tt$estimate[["mean in group 1"]],
+    Control      = tt$estimate[["mean in group 0"]],
+    Difference   = Treated - Control,
+    `p-value`    = tt$p.value
+  )
+})
+
+balance_q2 |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Mean Covariates by Treatment Status (DW Data)")
+```
+
+The balance table shows that the treatment and control groups differ substantially on average. All pre-treatment variables except `hispanic` exhibit statistically significant differences between the two groups. Practically, individuals who received the NSW treatment look very different from individuals in the PSID control group on essentially every observable dimension — they are younger, less educated, far more likely to be Black, far less likely to be married, and had dramatically lower pre-treatment earnings and higher unemployment rates. This is the textbook indication of poor covariate balance, and it motivates the entire analysis that follows.
+
+## Question 3
+
+**(a)** The ATT is more important for two reasons. First, since the program is for disadvantaged workers, individuals who actually enroll in it are going to look very different than the individuals who do not. The ATE would average the effect over the entire combined sample, which is dominated by PSID controls who are mostly older, married, employed, higher-earning men who would never realistically enroll in the program. Second, estimating the ATT only requires that for each treated unit there exist comparable controls, whereas estimating the ATE requires comparability in both directions. Given how different the controls are from the treated, many controls have no comparable treated units. For this reason, in our case ATT is a much more valuable estimate than ATE.
+
+**(b)** No, the ATE and ATT would not be expected to coincide in this application. The two parameters are equal only when treatment effects are homogeneous, or when the covariate distribution of the treated matches that of the full population. Neither condition holds here. Question 2 has already shown that the treatment and control groups have very different covariate distributions, and there is strong reason to expect treatment-effect heterogeneity: a job-training program plausibly benefits unemployed and low-earning workers far more than higher-earning, already-employed individuals. The ATT averages effects over the (disadvantaged) treated distribution, while the ATE averages over the full (largely advantaged) sample, so the two should diverge.
+
+## Question 4
+
+```{r}
+#| label: q4
+#| include: false
+moda <- lm(re78 ~ treat, data = nsw_dw_psid_df)
+modb <- lm(re78 ~ treat + age + education + black + hispanic + married +
+             nodegree + re74 + re75 + u74 + u75, data = nsw_dw_psid_df)
+
+control_df <- nsw_dw_psid_df |> filter(treat == 0)
+modc <- lm(re78 ~ age + education + black + hispanic + married + nodegree +
+             re74 + re75 + u74 + u75, data = control_df)
+
+treated_df <- nsw_dw_psid_df |> filter(treat == 1)
+y0_4c      <- predict(modc, newdata = treated_df)
+att_q4c    <- mean(treated_df$re78 - y0_4c)
+```
+
+Three reference estimates of the effect of the NSW program on 1978 earnings were computed:
+
+(a) An OLS regression of `re78` on the treatment indicator alone.
+(b) An OLS regression of `re78` on the treatment indicator and all ten pre-treatment covariates.
+(c) An OLS-based ATT estimator: an outcome regression of `re78` on the ten covariates fit on controls only, then used to impute counterfactual untreated outcomes for the treated.
+
+**(d)** None of the three estimates is close to the experimental benchmark of \$1,794.34. The unadjusted difference of means in (a) is large and negative because the PSID controls earned far more than the NSW treated. The covariate-adjusted OLS coefficient in (b) is much closer to zero but still nowhere near the benchmark. The OLS-based ATT estimator in (c) returns approximately −\$547, which has the *opposite sign* from the experimental estimate. This is precisely the failure mode of "just running regressions" without first confronting the lack of comparability between the treatment and control groups.
+
+## Question 5
+
+```{r}
+#| label: q5
+#| include: false
+X_full  <- nsw_dw_psid_df |> dplyr::select(all_of(covars)) |> as.matrix()
+Y_full  <- nsw_dw_psid_df$re78
+Tr_full <- nsw_dw_psid_df$treat
+
+m_q5 <- Match(Y = Y_full, Tr = Tr_full, X = X_full,
+              estimand = "ATT", M = 1, Weight = 1)
+```
+
+The matching estimator (one match, Abadie-Imbens distance, all ten covariates) yields an ATT estimate of approximately \$1,474 with an Abadie-Imbens standard error of \$1,952. This is a dramatic improvement relative to the OLS-based estimates in Question 4: the point estimate is within a few hundred dollars of the experimental benchmark of \$1,794.34 and has the correct sign. Relaxing OLS's linearity assumption on the outcome–covariate relationship clearly does meaningful work here, although the standard error remains large compared with the experimental benchmark, indicating limited precision.
+
+## Question 6
+
+```{r}
+#| label: q6-logit
+#| include: false
+ps_mod <- glm(
+  treat ~ age + I(age^2) + education + I(education^2) +
+    married + nodegree + black + hispanic +
+    re74 + re75 + I(re74^2) + I(re75^2) + u74:black,
+  data   = nsw_dw_psid_df,
+  family = binomial(link = "logit")
+)
+
+nsw_dw_psid_df <- nsw_dw_psid_df |>
+  mutate(pscore = predict(ps_mod, type = "response"))
+```
+
+The propensity score was estimated by fitting the logit specification used by Dehejia and Wahba (1999, Table 3 footnote *e*): a logit of `treat` on age, age², education, education², married, no-degree, black, Hispanic, re74, re75, re74², re75², and the interaction of `u74` and `black`. Predicted propensity scores were computed for every individual in the sample via `predict(ps_mod, type = "response")`. The fitted logit coefficients are reproduced in the Appendix.
+
+## Question 7
+
+**(a)** See Figure 1.
+
+```{r}
+#| label: q7-hist
+#| fig-cap: "Propensity score distributions by treatment status, full sample."
+ggplot(nsw_dw_psid_df, aes(x = pscore, fill = factor(treat))) +
+  geom_histogram(position = "identity", alpha = 0.5,
+                 bins = 40, color = "white") +
+  scale_fill_manual(values = c("0" = "steelblue", "1" = "tomato"),
+                    labels = c("0" = "Control (PSID)", "1" = "Treated (NSW)"),
+                    name   = NULL) +
+  labs(x = "Estimated propensity score", y = "Count") +
+  theme_bw()
+```
+
+**(b)** The histograms tell a clear story about comparability: the treatment and control groups are very poorly comparable in covariate space. The PSID controls pile up sharply near $\hat p = 0$ — most controls have estimated probabilities of treatment that are essentially zero. The NSW treated, by contrast, are spread across higher values, with a notable mass at $\hat p$ close to 1. The middle of the distribution is nearly empty for both groups. Estimating the ATT requires controls with covariate profiles similar to the treated, and the figure suggests that for many treated units no such controls exist in the sample.
+
+## Question 8
+
+```{r}
+#| label: q8-setup
+#| include: false
+ps_min <- min(nsw_dw_psid_df$pscore[nsw_dw_psid_df$treat == 1])
+ps_max <- max(nsw_dw_psid_df$pscore[nsw_dw_psid_df$treat == 1])
+
+nsw_dw_psid_df <- nsw_dw_psid_df |>
+  mutate(in_overlap = pscore >= ps_min & pscore <= ps_max)
+
+n_dropped  <- sum(nsw_dw_psid_df$treat == 0 & !nsw_dw_psid_df$in_overlap)
+n_kept     <- sum(nsw_dw_psid_df$treat == 0 &  nsw_dw_psid_df$in_overlap)
+overlap_df <- nsw_dw_psid_df |> filter(in_overlap)
+```
+
+**(a)** Imposing the DW overlap rule discards 503 control observations; 400 controls remain in the overlap region.
+
+**(b)** The intuition is that a control whose estimated propensity score lies outside the range of treated propensity scores has a covariate profile so unlike any NSW participant that no treated unit is comparable to it. Such a control provides no useful information about the counterfactual outcomes of the treated, and including it forces the outcome model to extrapolate into a region of covariate space where there are no comparable treated units. Dropping these controls eliminates units that could not be used credibly anyway.
+
+**(c)** The labor-market characteristics of the dropped controls differ dramatically from those of the kept controls. Dropped controls earned more than \$26,000 in both 1974 and 1975 — more than double the kept controls' average earnings — and were unemployed in only 3–4 percent of cases, compared with 14–19 percent of kept controls. Even though the propensity score collapses ten covariates into a single number, it identifies as outside the support of the treated precisely those controls whose pre-treatment labor-market histories look least like those of the NSW participants. The propensity score is doing exactly the job we hoped it would.
+
+```{r}
+#| label: q8c-table
+labor_vars <- c("re74", "re75", "u74", "u75")
+labor_labels <- c(re74 = "Earnings 1974", re75 = "Earnings 1975",
+                  u74  = "Unemployed 1974", u75  = "Unemployed 1975")
+
+dropped_vs_kept <- nsw_dw_psid_df |>
+  filter(treat == 0) |>
+  group_by(in_overlap) |>
+  summarise(across(all_of(labor_vars), mean), .groups = "drop") |>
+  pivot_longer(-in_overlap, names_to = "variable", values_to = "mean") |>
+  pivot_wider(names_from = in_overlap, values_from = mean,
+              names_prefix = "in_overlap_") |>
+  mutate(Variable = labor_labels[variable]) |>
+  dplyr::select(Variable, Kept = in_overlap_TRUE, Dropped = in_overlap_FALSE) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+dropped_vs_kept |>
+  knitr::kable(caption = "Average labor-market characteristics: dropped vs. kept controls")
+```
+
+**(d)** The balance table below compares the treatment and control groups *after* imposing overlap.
+
+```{r}
+#| label: q8d-balance
+balance_q8 <- map_dfr(covars, function(v) {
+  tibble(
+    Variable   = labels[[v]],
+    Treated    = mean(overlap_df[[v]][overlap_df$treat == 1]),
+    Control    = mean(overlap_df[[v]][overlap_df$treat == 0]),
+    Difference = Treated - Control
+  )
+})
+
+balance_q8 |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Mean Covariates by Treatment Status, After Imposing Overlap")
+```
+
+Compared with the table in Question 2, the differences between the treated and control averages have shrunk substantially on most covariates. Some imbalance remains, but the two groups are clearly more comparable than they were before trimming, and the residual differences are now within a range that flexible covariate adjustment can plausibly handle.
+
+## Question 9
+
+**(a)** See Figure 2 and Table 5.
+
+```{r}
+#| label: q9-hist
+#| fig-cap: "Propensity score distributions by treatment status, overlap region only."
+ggplot(overlap_df, aes(x = pscore, fill = factor(treat))) +
+  geom_histogram(position = "identity", alpha = 0.5,
+                 bins = 40, color = "white") +
+  scale_fill_manual(values = c("0" = "steelblue", "1" = "tomato"),
+                    labels = c("0" = "Control (PSID)", "1" = "Treated (NSW)"),
+                    name   = NULL) +
+  labs(x = "Estimated propensity score", y = "Count") +
+  theme_bw()
+```
+
+```{r}
+#| label: q9-quantiles
+detail_probs <- c(.25, .50, .75)
+
+ps_quantiles <- overlap_df |>
+  group_by(treat) |>
+  summarise(
+    n     = n(),
+    mean  = mean(pscore),
+    sd    = sd(pscore),
+    as_tibble_row(quantile(pscore, probs = detail_probs)),
+    .groups = "drop"
+  ) |>
+  mutate(Group = if_else(treat == 1, "Treated (NSW)", "Control (PSID)")) |>
+  dplyr::select(Group, n, mean, sd, `25%`, `50%`, `75%`) |>
+  mutate(across(where(is.numeric) & !n, \(x) round(x, 4)))
+
+ps_quantiles |>
+  knitr::kable(caption = "Summary of estimated propensity scores by treatment status, overlap region")
+```
+
+The overlap quality is poor even after trimming. The two distributions are concentrated at opposite ends of the supposedly overlapping support: three-quarters of the kept controls have $\hat p < 0.092$, while three-quarters of the treated have $\hat p > 0.658$. In other words, the supports of the two distributions formally overlap, but the masses are nearly disjoint. Most treated units have high p-scores with disproportionately few controls anywhere near them, and the bulk of controls live in a low-p-score region where there are few treated units. Each group is concentrated at the opposite end of the overlap range.
+
+**(b)** The implication for ATT estimation is that a small number of high-p-score controls will effectively carry the entire estimate. They will be reused frequently in matching, will receive extreme weights in propensity-score weighting, and will be heavily extrapolated to in regression adjustment. Because so much weight rides on this small support region, the estimated ATT should be expected to be sensitive to estimator choice. This is exactly the sensitivity documented in Question 11.
+
+## Question 10
+
+```{r}
+#| label: q10-setup
+#| include: false
+X_overlap  <- overlap_df |> dplyr::select(all_of(covars)) |> as.matrix()
+Y_overlap  <- overlap_df$re78
+Tr_overlap <- overlap_df$treat
+X_pscore   <- overlap_df$pscore
+
+controls_overlap <- overlap_df |> filter(treat == 0)
+treated_overlap  <- overlap_df |> filter(treat == 1)
+```
+
+```{r}
+#| label: q10a
+#| include: false
+m_q10 <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_overlap,
+               estimand = "ATT", M = 1, Weight = 1)
+```
+
+```{r}
+#| label: q10b
+#| include: false
+pscore_est_q10 <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_pscore,
+                        estimand = "ATT", M = 1, Weight = 1)
+```
+
+```{r}
+#| label: q10c
+#| include: false
+mod_q10c <- lm(re78 ~ pscore + I(pscore^2) + I(pscore^3),
+               data = controls_overlap)
+y0_q10c  <- predict(mod_q10c, newdata = treated_overlap)
+att_q10c <- mean(treated_overlap$re78 - y0_q10c)
+```
+
+Three ATT estimators were applied within the overlap region:
+
+(a) Nearest-neighbor matching on all ten covariates, Abadie-Imbens distance, one match: \$1,482 (SE \$1,923).
+(b) Nearest-neighbor matching on the propensity score, one match: \$1,398 (SE \$2,356).
+(c) OLS of the outcome on a cubic in the propensity score, estimated on controls only, with predicted counterfactual outcomes for the treated: \$2,120.
+
+**(d)** All three estimates fall within roughly \$300–\$400 of the experimental benchmark of \$1,794.34. The two matching estimators bracket the benchmark from below and the cubic-p-score regression sits slightly above, and all three have the correct (positive) sign. This is a substantial improvement over the estimates in Question 4 — combining the DW overlap rule with flexible covariate adjustment moves the non-experimental ATT into the same neighborhood as the experimental truth. One caveat: while the point estimates are close to the benchmark, the standard errors are large (roughly \$1,900–\$2,400 compared with \$633 for the experimental estimator). This reflects the poor overlap quality diagnosed in Question 9 — a small number of high-p-score controls do most of the work, so inference is imprecise even where point estimates are economically reasonable. This is the classic precision-accuracy trade-off that arises when overlap is thin.
+
+## Question 11
+
+```{r}
+#| label: q11a
+#| include: false
+m_q11a <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_overlap,
+                estimand = "ATT", M = 1, Weight = 2)
+```
+
+```{r}
+#| label: q11b
+#| include: false
+m_q11b <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_overlap,
+                estimand = "ATT", M = 2, Weight = 1)
+```
+
+```{r}
+#| label: q11c
+#| include: false
+m_q11c <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_overlap,
+                estimand = "ATT", M = 3, Weight = 1)
+```
+
+```{r}
+#| label: q11d
+#| include: false
+m_q11d <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_pscore,
+                estimand = "ATT", M = 2, Weight = 1)
+```
+
+```{r}
+#| label: q11e
+#| include: false
+m_q11e <- Match(Y = Y_overlap, Tr = Tr_overlap, X = X_pscore,
+                estimand = "ATT", M = 3, Weight = 1)
+```
+
+```{r}
+#| label: q11f
+#| include: false
+mod_q11f <- lm(re78 ~ pscore, data = controls_overlap)
+y0_q11f  <- predict(mod_q11f, newdata = treated_overlap)
+att_q11f <- mean(treated_overlap$re78 - y0_q11f)
+```
+
+```{r}
+#| label: q11g
+#| include: false
+mod_q11g <- lm(re78 ~ pscore + I(pscore^2), data = controls_overlap)
+y0_q11g  <- predict(mod_q11g, newdata = treated_overlap)
+att_q11g <- mean(treated_overlap$re78 - y0_q11g)
+```
+
+**(a)–(g)** Seven sensitivity estimators were run within the overlap region. Their estimates and standard errors are reported alongside the main results in Table 6.
+
+**(h)** The results are sensitive to estimator choice, and the sensitivity is concentrated in two places. First, swapping the Abadie-Imbens distance for Mahalanobis in covariate matching collapses the estimate from \$1,482 to \$154 — a swing of roughly \$1,300 produced solely by accounting for correlations among covariates rather than just their variances. Second, the OLS-on-p-score family is highly sensitive to functional form: the linear specification gives \$2,581, the cubic gives \$2,120, but the quadratic gives −\$1,604, switching the sign of the estimated program effect entirely. Within the matching family, increasing the number of matches from one to three pulls the covariate-matching estimates downward (\$1,482 → \$1,247 → \$877), consistent with adding lower-quality matches in a thin-overlap setting. These results are not surprising in light of Question 9: even after imposing overlap, the propensity-score distributions of the treated and control groups are nearly disjoint, so each estimator is leaning on essentially the same small set of high-p-score controls but weighting them differently. Different estimators are different ways of guessing at what is happening in a region of covariate space the data barely populate.
+
+## Question 12
+
+Table 6 summarizes all the estimates of the ATT obtained in Questions 4, 5, 10, and 11, along with their standard errors and significance indicators.
+
+```{r}
+#| label: q12-table
+#| message: false
+#| warning: false
+
+# ----- helpers -----
+star_fn <- function(est, se) {
+  if (is.na(est) || is.na(se) || se <= 0) return("")
+  p <- 2 * pnorm(-abs(est / se))
+  if (p < 0.01) "***"
+  else if (p < 0.05) "**"
+  else if (p < 0.10) "*"
+  else ""
+}
+
+fmt_money <- function(x) {
+  formatC(x, format = "f", big.mark = ",", digits = 2)
+}
+
+# Bootstrap SE for OLS-based ATT estimators (no closed-form SE)
+boot_ols_att_se <- function(data, rhs, n_boot = 1000, seed = 440) {
+  set.seed(seed)
+  ests <- replicate(n_boot, {
+    idx  <- sample(seq_len(nrow(data)), replace = TRUE)
+    d    <- data[idx, ]
+    ctrl <- d[d$treat == 0, , drop = FALSE]
+    trt  <- d[d$treat == 1, , drop = FALSE]
+    if (nrow(ctrl) < 20 || nrow(trt) < 10) return(NA_real_)
+    fmla <- as.formula(paste("re78 ~", rhs))
+    mod  <- tryCatch(lm(fmla, data = ctrl), error = function(e) NULL)
+    if (is.null(mod)) return(NA_real_)
+    y0 <- tryCatch(predict(mod, newdata = trt), error = function(e) NA_real_)
+    mean(trt$re78 - y0)
+  })
+  sd(ests, na.rm = TRUE)
+}
+
+# ----- pull / compute estimates and SEs -----
+est_q4a <- coef(moda)["treat"]
+se_q4a  <- summary(moda)$coefficients["treat", "Std. Error"]
+est_q4b <- coef(modb)["treat"]
+se_q4b  <- summary(modb)$coefficients["treat", "Std. Error"]
+se_q4c  <- boot_ols_att_se(nsw_dw_psid_df,
+                           paste(covars, collapse = " + "),
+                           seed = 1)
+
+est_q5 <- m_q5$est; se_q5 <- m_q5$se
+
+est_q10a <- m_q10$est;          se_q10a <- m_q10$se
+est_q10b <- pscore_est_q10$est; se_q10b <- pscore_est_q10$se
+se_q10c  <- boot_ols_att_se(overlap_df,
+                            "pscore + I(pscore^2) + I(pscore^3)",
+                            seed = 2)
+
+est_q11a <- m_q11a$est; se_q11a <- m_q11a$se
+est_q11b <- m_q11b$est; se_q11b <- m_q11b$se
+est_q11c <- m_q11c$est; se_q11c <- m_q11c$se
+est_q11d <- m_q11d$est; se_q11d <- m_q11d$se
+est_q11e <- m_q11e$est; se_q11e <- m_q11e$se
+se_q11f  <- boot_ols_att_se(overlap_df, "pscore",                 seed = 3)
+se_q11g  <- boot_ols_att_se(overlap_df, "pscore + I(pscore^2)",   seed = 4)
+
+# ----- assemble table -----
+make_rows <- function(name, est, se) {
+  s <- star_fn(est, se)
+  tibble(
+    Estimator      = c(name, ""),
+    `ATT Estimate` = c(paste0(fmt_money(est), s),
+                       paste0("(", fmt_money(se), ")"))
+  )
+}
+
+tbl_q12 <- bind_rows(
+  tibble(Estimator = "Estimators Used Without Imposing Overlap",
+         `ATT Estimate` = ""),
+  make_rows("Unadjusted Difference of Means",
+            est_q4a, se_q4a),
+  make_rows("OLS of Outcome on Treatment Indicator and Covariates",
+            est_q4b, se_q4b),
+  make_rows("Estimator based on OLS of Outcome on Covariates for Controls",
+            as.numeric(att_q4c), se_q4c),
+  make_rows("Matching on the Covariates (1 match, Abadie-Imbens metric)",
+            est_q5, se_q5),
+
+  tibble(Estimator = "Estimators Used After Imposing Overlap -- Main Results",
+         `ATT Estimate` = ""),
+  make_rows("Matching on the Covariates (1 match, Abadie-Imbens metric)",
+            est_q10a, se_q10a),
+  make_rows("Matching on the P-score (1 match)",
+            est_q10b, se_q10b),
+  make_rows("Estimator based on OLS of Outcome on Cubic P-score for Controls",
+            as.numeric(att_q10c), se_q10c),
+
+  tibble(Estimator = "Sensitivity Analysis", `ATT Estimate` = ""),
+  make_rows("Matching on the Covariates (1 match, Mahalanobis metric)",
+            est_q11a, se_q11a),
+  make_rows("Matching on the Covariates (2 matches, Abadie-Imbens metric)",
+            est_q11b, se_q11b),
+  make_rows("Matching on the Covariates (3 matches, Abadie-Imbens metric)",
+            est_q11c, se_q11c),
+  make_rows("Matching on the P-score (2 matches)",
+            est_q11d, se_q11d),
+  make_rows("Matching on the P-score (3 matches)",
+            est_q11e, se_q11e),
+  make_rows("Estimator based on OLS of Outcome on Linear P-score for Controls",
+            as.numeric(att_q11f), se_q11f),
+  make_rows("Estimator based on OLS of Outcome on Quadratic P-score for Controls",
+            as.numeric(att_q11g), se_q11g),
+
+  tibble(
+    Estimator      = c("Number of observations before imposing overlap",
+                       "Number of observations after imposing overlap"),
+    `ATT Estimate` = c(as.character(nrow(nsw_dw_psid_df)),
+                       as.character(nrow(overlap_df)))
+  )
+)
+
+tbl_q12 |>
+  knitr::kable(
+    align   = c("l", "r"),
+    caption = "Estimates of the Average Treatment Effect on the Treated (ATT) of the NSW Job Training Program on 1978 Earnings based on Dehejia and Wahba's (1999) Nonexperimental Sample"
+  )
+```
+
+*Notes: Standard errors in parentheses. Standard errors for matching estimators are the Abadie-Imbens standard errors reported by the `Matching` package. Standard errors for the OLS-based ATT estimators are computed via 1,000 bootstrap replications. \*p\<0.10, \*\*p\<0.05, \*\*\*p\<0.01.*
+
+## Question 13
+
+If the analysis were repeated using the experimental data, several differences would emerge. Most importantly, the overlap would look much better. Under random assignment, the treatment and control groups have, in expectation, the same covariate distribution. Fitting the same logit model would therefore produce much smaller and largely insignificant coefficients, and the predicted propensity scores would concentrate in the same region for both groups. The two histograms would overlap almost perfectly rather than living at opposite ends of the \[0, 1\] interval. Because of this strong overlap, very few control observations would be discarded by the DW overlap rule, and overlap quality within the support region would be high. Most importantly, the non-experimental estimates would be much less sensitive to estimator choice: when treated and control units are genuinely comparable, every reasonable estimator should land near the experimental benchmark. Good data lead to good overlap, which in turn lead to unconfoundedness-based estimators that nearly all agree.
+
+## Question 14
+
+**(a)** When estimating causal average treatment effects under an unconfoundedness-based design, four elements are essential. First, choosing the right covariates matters — particularly those that drive both treatment assignment and the outcome (in training-program evaluation, this means labor market history, as Question 1 emphasized). Second, the analysis requires meaningful overlap in covariate distributions; the propensity score is a tool for both diagnosing overlap and enforcing it via trimming. Third, flexible adjustment methods such as matching and propensity-score-based estimation reduce dependence on the parametric assumptions that OLS implicitly imposes. Finally, the analysis must be diagnostic in nature: checking balance tables before and after adjustment, examining overlap visually and quantitatively, and testing multiple estimators with different specifications to gauge sensitivity.
+
+**(b)** The principal advantage of matching and propensity-score methods over OLS is that they do not impose a linearity assumption on the outcome–covariate relationship. They also make overlap visible, so the analyst can see directly when the data fail to support comparison and can discard observations outside the support region. Matching also makes the comparison group explicit — one can identify which controls served as counterfactuals for the treated — whereas OLS hides this in the coefficients. Most importantly, these methods expose the limits of the data: when overlap is poor, standard errors widen and sensitivity to estimator choice increases, giving the analyst an honest signal that the data cannot tightly identify the treatment effect. OLS, by contrast, often produces a coefficient with a misleadingly tight standard error in exactly the same situation, giving false confidence in an extrapolation that the data do not support.
+
+\newpage
+
+## Appendix: Code
+
+The following chunks reproduce the complete R code used in this analysis.
+
+```{r}
+#| label: appendix
+#| ref.label: !expr setdiff(knitr::all_labels(), "appendix")
+#| echo: true
+#| eval: false
+```
