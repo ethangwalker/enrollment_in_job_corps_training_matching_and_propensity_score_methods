@@ -4,8 +4,6 @@ Can non-experimental methods recover an experimental treatment effect? This proj
 
 The analysis follows an unconfoundedness-based design. It diagnoses covariate imbalance, estimates a propensity score, imposes overlap and compares a set of matching and propensity-score estimators with naive OLS.
 
-> Problem Set 3 for ECON 440 (Unconfoundedness-Based Designs), written in Quarto and R.
-
 ------------------------------------------------------------------------
 
 ## Key Findings
